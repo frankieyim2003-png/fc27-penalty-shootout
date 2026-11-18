@@ -442,7 +442,7 @@
                     </button>
                 </div>
                 <p id="onlineShareHint" class="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-                    Have your friend open your Google Site (or game link), tap <span class="text-cyan-300 font-bold">ONLINE</span>, and enter this 6-character code below.
+                    Have your friend open this same game link, tap <span class="text-cyan-300 font-bold">ONLINE</span>, and enter this 6-character code below.
                 </p>
                 <div id="copyUrlFeedback" class="hidden mt-1.5 text-[11px] font-bold text-emerald-400">
                     ✓ Copied to clipboard! Send it to your friend to connect.
@@ -455,7 +455,7 @@
                     2. Or Enter Your Friend's Room Code
                 </label>
                 <form id="joinOnlineRoomForm" class="flex items-center gap-2">
-                    <input id="joinRoomCodeInput" type="text" maxlength="64" placeholder="Enter 6-character Room Code..." class="flex-1 bg-slate-950 border border-slate-700 focus:border-cyan-400 rounded-xl px-3 py-2 text-xs sm:text-sm text-white uppercase tracking-widest placeholder-slate-500 outline-none">
+                    <input id="joinRoomCodeInput" type="text" maxlength="64" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="Enter 6-character Room Code..." class="flex-1 bg-slate-950 border border-slate-700 focus:border-cyan-400 rounded-xl px-3 py-2 text-xs sm:text-sm text-white uppercase tracking-widest placeholder-slate-500 outline-none">
                     <button type="submit" class="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs uppercase tracking-wider cursor-pointer shrink-0">
                         JOIN
                     </button>
@@ -502,46 +502,6 @@
             bgCacheValid = false;
         }
         window.addEventListener('resize', resizeCanvas);
-
-        // --- 2. PEERJS P2P MULTIPLAYER LOADER (GOOGLE SITES & CROSS-BROWSER READY) ---
-        let peerJsLoadPromise = null;
-        function ensurePeerJSLib() {
-            if (typeof window.Peer !== 'undefined') {
-                return Promise.resolve(window.Peer);
-            }
-            if (peerJsLoadPromise) return peerJsLoadPromise;
-
-            const urls = [
-                'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js',
-                'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'
-            ];
-
-            peerJsLoadPromise = new Promise((resolve, reject) => {
-                let idx = 0;
-                function tryNext() {
-                    if (typeof window.Peer !== 'undefined') {
-                        resolve(window.Peer);
-                        return;
-                    }
-                    if (idx >= urls.length) {
-                        peerJsLoadPromise = null;
-                        reject(new Error('Could not load multiplayer network library.'));
-                        return;
-                    }
-                    const script = document.createElement('script');
-                    script.src = urls[idx++];
-                    script.async = true;
-                    script.onload = () => {
-                        if (typeof window.Peer !== 'undefined') resolve(window.Peer);
-                        else tryNext();
-                    };
-                    script.onerror = () => tryNext();
-                    document.head.appendChild(script);
-                }
-                tryNext();
-            });
-            return peerJsLoadPromise;
-        }
 
         // --- 3. INLINE SVG ICONS & EA FC 27 PLAYSTYLES+ DATABASE ---
         const ICONS = {
@@ -961,10 +921,23 @@
             skipHandoff: false
         };
 
-        // Online Multiplayer State (WebRTC P2P)
+        // Online Multiplayer State (public relay, not WebRTC)
         const onlineState = {
-            peer: null,
-            conn: null,
+            relay: null,
+            clientId: null,
+            seq: 0,
+            seenIds: null,
+            peerRelays: null,
+            chosenRelays: null,
+            prevRoomStatus: null,
+            lastRev: 0,
+            unacked: null,
+            peerGone: false,
+            helloTimer: null,
+            heartbeatTimer: null,
+            joinWatchTimer: null,
+            readyWatchTimer: null,
+            relayChangeTimer: null,
             roomId: null,
             role: 1, // 1 = Host (Player 1), 2 = Guest (Player 2)
             room: null,
@@ -2118,18 +2091,500 @@
             }
         }
 
-        // --- 14. ONLINE MULTIPLAYER ENGINE (WEBRTC P2P — GOOGLE SITES READY) ---
-        const PEER_PREFIX = 'FC27PS-';
-        const PEER_CONFIG = {
-            debug: 0,
-            config: {
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' }
-                ]
+        // --- 14. ONLINE MULTIPLAYER ENGINE ---
+        // WebRTC + the public PeerJS TURN relays cannot connect two phones.
+        // Those relay hostnames no longer resolve, and the old config kept STUN only.
+        // Match messages now go out over normal HTTPS/WebSocket to public brokers,
+        // which works through mobile NAT, CGNAT, and most school firewalls.
+        const RELAY_PREF = ['emqx', 'hivemq', 'mosquitto', 'ntfy'];
+
+        function randomOnlineToken(len) {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            let out = '';
+            for (let i = 0; i < len; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
+            return out;
+        }
+
+        function mqttRemainingLength(len) {
+            const bytes = [];
+            do {
+                let digit = len % 128;
+                len = Math.floor(len / 128);
+                if (len > 0) digit = digit | 128;
+                bytes.push(digit);
+            } while (len > 0);
+            return new Uint8Array(bytes);
+        }
+
+        function mqttConcat(parts) {
+            let total = 0;
+            for (let i = 0; i < parts.length; i++) total += parts[i].length;
+            const out = new Uint8Array(total);
+            let offset = 0;
+            for (let i = 0; i < parts.length; i++) {
+                out.set(parts[i], offset);
+                offset += parts[i].length;
             }
-        };
+            return out;
+        }
+
+        function mqttUtf8(str) {
+            const body = new TextEncoder().encode(str);
+            const out = new Uint8Array(2 + body.length);
+            out[0] = (body.length >> 8) & 255;
+            out[1] = body.length & 255;
+            out.set(body, 2);
+            return out;
+        }
+
+        function mqttPacket(typeByte, body) {
+            const rem = mqttRemainingLength(body.length);
+            const out = new Uint8Array(1 + rem.length + body.length);
+            out[0] = typeByte;
+            out.set(rem, 1);
+            out.set(body, 1 + rem.length);
+            return out;
+        }
+
+        function mqttConnectPacket(clientId) {
+            const proto = mqttUtf8('MQTT');
+            const head = new Uint8Array(proto.length + 4);
+            head.set(proto, 0);
+            head[proto.length] = 4;
+            head[proto.length + 1] = 2;
+            head[proto.length + 2] = 0;
+            head[proto.length + 3] = 30;
+            return mqttPacket(0x10, mqttConcat([head, mqttUtf8(clientId)]));
+        }
+
+        function mqttSubscribePacket(topic) {
+            const encoded = mqttUtf8(topic);
+            const body = new Uint8Array(2 + encoded.length + 1);
+            body[0] = 0;
+            body[1] = 1;
+            body.set(encoded, 2);
+            body[body.length - 1] = 0;
+            return mqttPacket(0x82, body);
+        }
+
+        function mqttPublishPacket(topic, text) {
+            return mqttPacket(0x30, mqttConcat([mqttUtf8(topic), new TextEncoder().encode(text)]));
+        }
+
+        function createMqttLink(id, url, topic, ctx) {
+            const link = { id: id, ready: false };
+            let stopped = false;
+            let socket = null;
+            let pingTimer = null;
+            let attempt = 0;
+            let reconnectTimer = null;
+            let buf = new Uint8Array(0);
+
+            function cleanupSocket() {
+                if (pingTimer) clearInterval(pingTimer);
+                pingTimer = null;
+                link.ready = false;
+                if (socket) {
+                    const old = socket;
+                    socket = null;
+                    old.onopen = null;
+                    old.onmessage = null;
+                    old.onerror = null;
+                    old.onclose = null;
+                    try { old.close(); } catch (_) {}
+                }
+            }
+
+            function scheduleReconnect() {
+                if (stopped) return;
+                attempt += 1;
+                const delay = Math.min(10000, 1000 * attempt);
+                reconnectTimer = setTimeout(connect, delay);
+            }
+
+            function handleBytes(first, body) {
+                const type = first >> 4;
+                if (type === 2) {
+                    const code = body.length > 1 ? body[1] : 0;
+                    if (code !== 0) {
+                        try { if (socket) socket.close(); } catch (_) {}
+                        return;
+                    }
+                    link.ready = true;
+                    attempt = 0;
+                    try { if (socket) socket.send(mqttSubscribePacket(topic)); } catch (_) {}
+                    if (pingTimer) clearInterval(pingTimer);
+                    pingTimer = setInterval(() => {
+                        if (socket && socket.readyState === 1) {
+                            try { socket.send(new Uint8Array([0xC0, 0x00])); } catch (_) {}
+                        }
+                    }, 20000);
+                    ctx.onLinkReady();
+                } else if (type === 3) {
+                    const qos = (first >> 1) & 3;
+                    if (body.length < 2) return;
+                    const tlen = (body[0] << 8) | body[1];
+                    let offset = 2 + tlen;
+                    if (qos > 0) offset += 2;
+                    if (offset > body.length || offset < 0) return;
+                    ctx.onText(new TextDecoder().decode(body.subarray(offset)));
+                }
+            }
+
+            function drain() {
+                while (buf.length >= 2) {
+                    let multiplier = 1;
+                    let value = 0;
+                    let i = 1;
+                    let completeLen = false;
+                    for (; i < buf.length && i < 5; i++) {
+                        const digit = buf[i];
+                        value += (digit & 127) * multiplier;
+                        multiplier *= 128;
+                        if ((digit & 128) === 0) {
+                            completeLen = true;
+                            break;
+                        }
+                    }
+                    if (!completeLen) return;
+                    const headerLen = i + 1;
+                    if (buf.length < headerLen + value) return;
+                    const first = buf[0];
+                    const body = buf.subarray(headerLen, headerLen + value);
+                    buf = buf.subarray(headerLen + value);
+                    handleBytes(first, body);
+                }
+            }
+
+            function connect() {
+                if (stopped) return;
+                cleanupSocket();
+                buf = new Uint8Array(0);
+                let ws;
+                try {
+                    ws = new WebSocket(url, ['mqtt']);
+                } catch (_) {
+                    scheduleReconnect();
+                    return;
+                }
+                socket = ws;
+                ws.binaryType = 'arraybuffer';
+                const openTimer = setTimeout(() => {
+                    if (socket === ws && !link.ready) {
+                        try { ws.close(); } catch (_) {}
+                    }
+                }, 8000);
+                ws.onopen = () => {
+                    try { ws.send(mqttConnectPacket(id.charAt(0) + randomOnlineToken(10))); }
+                    catch (_) { try { ws.close(); } catch (__) {} }
+                };
+                ws.onmessage = (ev) => {
+                    if (socket !== ws) return;
+                    const chunk = new Uint8Array(ev.data);
+                    const next = new Uint8Array(buf.length + chunk.length);
+                    next.set(buf, 0);
+                    next.set(chunk, buf.length);
+                    buf = next;
+                    drain();
+                };
+                ws.onerror = () => {};
+                ws.onclose = () => {
+                    clearTimeout(openTimer);
+                    if (socket === ws) socket = null;
+                    const wasReady = link.ready;
+                    if (pingTimer) clearInterval(pingTimer);
+                    pingTimer = null;
+                    link.ready = false;
+                    if (wasReady) ctx.onLinkReady();
+                    scheduleReconnect();
+                };
+            }
+
+            link.publish = (text) => {
+                if (!link.ready || !socket || socket.readyState !== 1) return false;
+                try {
+                    socket.send(mqttPublishPacket(topic, text));
+                    return true;
+                } catch (_) {
+                    return false;
+                }
+            };
+            link.stop = () => {
+                stopped = true;
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                cleanupSocket();
+            };
+            link.kick = () => {
+                if (stopped || link.ready) return;
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                connect();
+            };
+            connect();
+            return link;
+        }
+
+        function createNtfyLink(topic, ctx) {
+            const link = { id: 'ntfy', ready: false };
+            let stopped = false;
+            let socket = null;
+            let attempt = 0;
+            let reconnectTimer = null;
+
+            function schedule() {
+                if (stopped) return;
+                attempt += 1;
+                reconnectTimer = setTimeout(connect, Math.min(10000, 1000 * attempt));
+            }
+
+            function connect() {
+                if (stopped) return;
+                if (socket) {
+                    const old = socket;
+                    socket = null;
+                    old.onopen = null;
+                    old.onmessage = null;
+                    old.onerror = null;
+                    old.onclose = null;
+                    try { old.close(); } catch (_) {}
+                }
+                link.ready = false;
+                let ws;
+                try {
+                    ws = new WebSocket('wss://ntfy.sh/' + topic + '/ws');
+                } catch (_) {
+                    schedule();
+                    return;
+                }
+                socket = ws;
+                const openTimer = setTimeout(() => {
+                    if (socket === ws && !link.ready) {
+                        try { ws.close(); } catch (_) {}
+                    }
+                }, 8000);
+                ws.onopen = () => {
+                    clearTimeout(openTimer);
+                    if (socket !== ws) return;
+                    link.ready = true;
+                    attempt = 0;
+                    ctx.onLinkReady();
+                };
+                ws.onmessage = (ev) => {
+                    let data;
+                    try { data = JSON.parse(ev.data); } catch (_) { return; }
+                    if (!data || data.event !== 'message' || typeof data.message !== 'string') return;
+                    ctx.onText(data.message);
+                };
+                ws.onerror = () => {};
+                ws.onclose = () => {
+                    clearTimeout(openTimer);
+                    if (socket === ws) socket = null;
+                    const wasReady = link.ready;
+                    link.ready = false;
+                    if (wasReady) ctx.onLinkReady();
+                    schedule();
+                };
+            }
+
+            link.publish = (text) => {
+                if (!link.ready || text.length > 3800) return false;
+                fetch('https://ntfy.sh/' + topic, {
+                    method: 'POST',
+                    headers: { 'X-Cache': 'no', 'X-Firebase': 'no' },
+                    body: text
+                }).then((res) => {
+                    if (res.status === 429) link.ready = false;
+                }).catch(() => {});
+                return true;
+            };
+            link.stop = () => {
+                stopped = true;
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                link.ready = false;
+                if (socket) {
+                    const old = socket;
+                    socket = null;
+                    old.onclose = null;
+                    try { old.close(); } catch (_) {}
+                }
+            };
+            link.kick = () => {
+                if (stopped || link.ready) return;
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                connect();
+            };
+            connect();
+            return link;
+        }
+
+        function refreshChosenRelays() {
+            const mine = onlineState.relay ? onlineState.relay.openIds() : [];
+            const peer = onlineState.peerRelays;
+            if (!peer || !peer.length) {
+                onlineState.chosenRelays = null;
+                return;
+            }
+            const both = [];
+            for (let i = 0; i < RELAY_PREF.length; i++) {
+                const id = RELAY_PREF[i];
+                if (mine.indexOf(id) !== -1 && peer.indexOf(id) !== -1) both.push(id);
+            }
+            onlineState.chosenRelays = both.length ? both.slice(0, 2) : null;
+        }
+
+        function notePeerRelays(list) {
+            if (!Array.isArray(list) || !list.length) return;
+            onlineState.peerRelays = list.slice();
+            refreshChosenRelays();
+        }
+
+        function acceptOnlinePacket(msg) {
+            if (!msg || typeof msg !== 'object') return false;
+            if (!onlineState.clientId || msg.from === onlineState.clientId) return false;
+            if (msg.roomId && onlineState.roomId && msg.roomId !== onlineState.roomId) return false;
+            if (Array.isArray(msg.relays) && msg.relays.length) notePeerRelays(msg.relays);
+            if (msg.id) {
+                if (!onlineState.seenIds) onlineState.seenIds = new Set();
+                if (onlineState.seenIds.has(msg.id)) return false;
+                onlineState.seenIds.add(msg.id);
+                if (onlineState.seenIds.size > 400) {
+                    const oldest = onlineState.seenIds.values().next().value;
+                    onlineState.seenIds.delete(oldest);
+                }
+            }
+            return true;
+        }
+
+        function clearOnlineTimers() {
+            if (onlineState.helloTimer) clearInterval(onlineState.helloTimer);
+            if (onlineState.heartbeatTimer) clearInterval(onlineState.heartbeatTimer);
+            if (onlineState.joinWatchTimer) clearInterval(onlineState.joinWatchTimer);
+            if (onlineState.readyWatchTimer) clearTimeout(onlineState.readyWatchTimer);
+            if (onlineState.relayChangeTimer) clearTimeout(onlineState.relayChangeTimer);
+            onlineState.helloTimer = null;
+            onlineState.heartbeatTimer = null;
+            onlineState.joinWatchTimer = null;
+            onlineState.readyWatchTimer = null;
+            onlineState.relayChangeTimer = null;
+        }
+
+        function resetOnlineCounters() {
+            onlineState.seq = 0;
+            onlineState.seenIds = new Set();
+            onlineState.peerRelays = null;
+            onlineState.chosenRelays = null;
+            onlineState.prevRoomStatus = null;
+            onlineState.lastRev = 0;
+            onlineState.unacked = null;
+            onlineState.peerGone = false;
+            onlineState.clientId = 'p' + randomOnlineToken(8);
+        }
+
+        function scheduleRelayChange() {
+            if (onlineState.relayChangeTimer) clearTimeout(onlineState.relayChangeTimer);
+            onlineState.relayChangeTimer = setTimeout(handleRelayChange, 280);
+        }
+
+        function handleRelayChange() {
+            onlineState.relayChangeTimer = null;
+            refreshChosenRelays();
+            if (!onlineState.relay || !onlineState.roomId) return;
+            if (onlineState.role === 1 && onlineState.room) {
+                if (onlineState.relay.openIds().length && onlineState.room.status === 'WAITING') {
+                    setOnlineStatusUI('Room live! Waiting for friend to enter code...', 'bg-emerald-400 animate-pulse', onlineState.roomId);
+                }
+                broadcastHostRoomState();
+            } else if (onlineState.role === 2) {
+                sendOnlineMessage({
+                    type: 'HERE',
+                    id: onlineState.clientId + '-here-' + Date.now()
+                });
+            }
+        }
+
+        function createMatchRelay(onPacket) {
+            const roomCode = onlineState.roomId;
+            const mqttTopic = 'fc27ps/r/' + roomCode;
+            const ntfyTopic = 'fc27ps-' + roomCode;
+            const queue = [];
+            const links = Object.create(null);
+            let stopped = false;
+
+            function openIds() {
+                const ids = [];
+                for (const id in links) {
+                    if (links[id].ready) ids.push(id);
+                }
+                return ids;
+            }
+
+            function targetIds() {
+                const chosen = onlineState.chosenRelays;
+                if (chosen && chosen.length) {
+                    const out = [];
+                    for (let i = 0; i < chosen.length; i++) {
+                        if (links[chosen[i]] && links[chosen[i]].ready) out.push(chosen[i]);
+                    }
+                    if (out.length) return out;
+                }
+                return openIds();
+            }
+
+            function publishText(text) {
+                const targets = targetIds();
+                let sent = 0;
+                for (let i = 0; i < targets.length; i++) {
+                    if (links[targets[i]].publish(text)) sent += 1;
+                }
+                return sent;
+            }
+
+            function flushQueue() {
+                if (!queue.length) return;
+                const pending = queue.splice(0, queue.length);
+                for (let i = 0; i < pending.length; i++) {
+                    if (!publishText(pending[i])) queue.push(pending[i]);
+                }
+                if (queue.length > 12) queue.splice(0, queue.length - 12);
+            }
+
+            const ctx = {
+                onText(text) {
+                    let msg;
+                    try { msg = JSON.parse(text); } catch (_) { return; }
+                    try { onPacket(msg); } catch (_) {}
+                },
+                onLinkReady() {
+                    if (stopped) return;
+                    refreshChosenRelays();
+                    flushQueue();
+                    scheduleRelayChange();
+                }
+            };
+
+            links.emqx = createMqttLink('emqx', 'wss://broker.emqx.io:8084/mqtt', mqttTopic, ctx);
+            links.hivemq = createMqttLink('hivemq', 'wss://broker.hivemq.com:8884/mqtt', mqttTopic, ctx);
+            links.mosquitto = createMqttLink('mosquitto', 'wss://test.mosquitto.org:8081/mqtt', mqttTopic, ctx);
+            links.ntfy = createNtfyLink(ntfyTopic, ctx);
+
+            return {
+                send(obj) {
+                    let text;
+                    try { text = JSON.stringify(obj); } catch (_) { return; }
+                    if (!publishText(text)) {
+                        queue.push(text);
+                        if (queue.length > 12) queue.shift();
+                    }
+                },
+                openIds: openIds,
+                nudge() {
+                    for (const id in links) links[id].kick();
+                },
+                close() {
+                    stopped = true;
+                    for (const id in links) links[id].stop();
+                }
+            };
+        }
 
         function generateRoomCode() {
             const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -2159,7 +2614,7 @@
             inputEl.value = roomId;
             labelEl.textContent = '1. Send This 6-Character Room Code To Your Friend';
             copyBtn.textContent = 'COPY CODE';
-            hintEl.innerHTML = `Your friend opens your Google Site (or game), taps <span class="text-cyan-300 font-bold">ONLINE</span>, and types <span class="text-cyan-300 font-bold">${roomId}</span> in Join.`;
+            hintEl.innerHTML = `Your friend opens this same game link, taps <span class="text-cyan-300 font-bold">ONLINE</span>, and types <span class="text-cyan-300 font-bold">${roomId}</span> in Join.`;
         }
 
         function getRoomCodeFromCurrentLocation() {
@@ -2179,26 +2634,44 @@
         }
 
         function destroyOnlinePeer() {
-            if (onlineState.conn) {
-                try { onlineState.conn.close(); } catch (_) {}
-                onlineState.conn = null;
+            const relay = onlineState.relay;
+            if (relay && onlineState.roomId && onlineState.clientId) {
+                try {
+                    sendOnlineMessage({ type: 'LEAVE', id: onlineState.clientId + '-bye-' + Date.now() });
+                } catch (_) {}
             }
-            if (onlineState.peer) {
-                try { onlineState.peer.destroy(); } catch (_) {}
-                onlineState.peer = null;
+            clearOnlineTimers();
+            onlineState.relay = null;
+            if (relay) {
+                setTimeout(() => {
+                    try { relay.close(); } catch (_) {}
+                }, 250);
             }
         }
 
         function sendOnlineMessage(payload) {
-            if (onlineState.conn && onlineState.conn.open) {
-                try {
-                    onlineState.conn.send(payload);
-                } catch (_) {}
+            if (!onlineState.relay || !payload) return;
+            const msg = {};
+            for (const key in payload) {
+                if (Object.prototype.hasOwnProperty.call(payload, key)) msg[key] = payload[key];
             }
+            msg.from = onlineState.clientId;
+            msg.roomId = onlineState.roomId;
+            msg.relays = onlineState.relay.openIds();
+            if (!msg.id) msg.id = onlineState.clientId + '-' + (++onlineState.seq);
+            onlineState.relay.send(msg);
+        }
+
+        function queueGuestAction(payload) {
+            payload.tries = 0;
+            if (!payload.id) payload.id = onlineState.clientId + '-a' + (++onlineState.seq);
+            onlineState.unacked = payload;
+            sendOnlineMessage(payload);
         }
 
         function broadcastHostRoomState() {
             if (onlineState.role !== 1 || !onlineState.room) return;
+            onlineState.room.rev = (onlineState.room.rev || 0) + 1;
             applyRoomSnapshot(onlineState.room);
             sendOnlineMessage({
                 type: 'STATE_SYNC',
@@ -2237,7 +2710,136 @@
             }
         }
 
-        async function createOnlineRoom(retryCount = 0) {
+        function handleHostPacket(msg) {
+            if (!msg || typeof msg !== 'object' || !onlineState.room) return;
+
+            if (msg.type === 'HELLO') {
+                onlineState.room.guestStrikerId = msg.strikerId || 'messi';
+                onlineState.room.guestKeeperId = msg.keeperId || 'luca';
+                if (onlineState.room.status === 'WAITING') {
+                    onlineState.room.status = 'ST_AIM';
+                }
+                broadcastHostRoomState();
+            } else if (msg.type === 'LOADOUT') {
+                if (msg.strikerId) onlineState.room.guestStrikerId = msg.strikerId;
+                if (msg.keeperId) onlineState.room.guestKeeperId = msg.keeperId;
+                broadcastHostRoomState();
+            } else if (msg.type === 'SHOT_SUBMIT' && msg.shot) {
+                if (onlineState.room.status === 'ST_AIM' && onlineState.room.currentShooter === 2) {
+                    onlineState.room.status = 'GK_DEFEND';
+                    onlineState.room.shotId = (onlineState.room.shotId || 0) + 1;
+                    onlineState.room.lockedShot = msg.shot;
+                    onlineState.room.keeperDive = null;
+                    onlineState.room.lastOutcome = null;
+                    broadcastHostRoomState();
+                }
+            } else if (msg.type === 'KEEPER_DIVE') {
+                if (onlineState.room.status === 'GK_DEFEND' && onlineState.room.currentShooter === 1) {
+                    onlineState.room.keeperDive = {
+                        targetX: msg.targetX,
+                        targetY: msg.targetY,
+                        committed: true
+                    };
+                    broadcastHostRoomState();
+                }
+            } else if (msg.type === 'REMATCH') {
+                resetOnlineHostRoom();
+            }
+        }
+
+        function handlePeerLeft() {
+            onlineState.peerGone = true;
+            if (onlineState.role === 1 && onlineState.room) {
+                onlineState.room.status = 'WAITING';
+                onlineState.room.lockedShot = null;
+                onlineState.room.keeperDive = null;
+                onlineState.prevRoomStatus = 'WAITING';
+                onlineState.localPhase = 'WAITING';
+                openOnlineLobby();
+                setOnlineStatusUI('Friend left. Waiting for them to rejoin...', 'bg-amber-400 animate-pulse', onlineState.roomId);
+                updateHUD();
+            } else if (onlineState.role === 2) {
+                openOnlineLobby();
+                setOnlineStatusUI('Host left the match. Ask them for a new room code.', 'bg-rose-500', onlineState.roomId);
+            }
+        }
+
+        function handleOnlinePacket(msg) {
+            if (!acceptOnlinePacket(msg)) return;
+            if (msg.type === 'LEAVE') {
+                handlePeerLeft();
+                return;
+            }
+            if (msg.type === 'HELLO') onlineState.peerGone = false;
+            if (onlineState.peerGone && msg.type !== 'HELLO') return;
+            if (onlineState.role === 1) {
+                handleHostPacket(msg);
+            } else if (msg.type === 'STATE_SYNC' && msg.room) {
+                const rev = Number(msg.room.rev) || 0;
+                if (rev && onlineState.lastRev && rev <= onlineState.lastRev) return;
+                if (rev) onlineState.lastRev = rev;
+                applyRoomSnapshot(msg.room);
+            }
+        }
+
+        function startHostHeartbeat() {
+            if (onlineState.heartbeatTimer) clearInterval(onlineState.heartbeatTimer);
+            let lastSlowBeat = 0;
+            onlineState.heartbeatTimer = setInterval(() => {
+                if (onlineState.role !== 1 || !onlineState.room || !onlineState.relay) return;
+                const chosen = onlineState.chosenRelays;
+                const ntfyOnly = !!(chosen && chosen.length === 1 && chosen[0] === 'ntfy');
+                if (onlineState.room.status !== 'WAITING' && ntfyOnly) {
+                    const now = Date.now();
+                    if (now - lastSlowBeat < 8000) return;
+                    lastSlowBeat = now;
+                }
+                broadcastHostRoomState();
+            }, 2500);
+        }
+
+        function startGuestHello() {
+            if (onlineState.helloTimer) clearInterval(onlineState.helloTimer);
+            const helloId = onlineState.clientId + '-hello';
+            const sendHello = () => {
+                if (onlineState.role !== 2 || !onlineState.relay) return;
+                if (onlineState.room && onlineState.room.status && onlineState.room.status !== 'WAITING') return;
+                sendOnlineMessage({
+                    type: 'HELLO',
+                    id: helloId,
+                    strikerId: state.equipped,
+                    keeperId: state.equippedGK
+                });
+            };
+            sendHello();
+            onlineState.helloTimer = setInterval(sendHello, 1600);
+        }
+
+        function startGuestResend() {
+            if (onlineState.joinWatchTimer) clearInterval(onlineState.joinWatchTimer);
+            let ticks = 0;
+            onlineState.joinWatchTimer = setInterval(() => {
+                ticks += 1;
+                if (onlineState.role !== 2 || !onlineState.roomId) return;
+                const connected = onlineState.room && onlineState.room.status && onlineState.room.status !== 'WAITING';
+                if (!connected) {
+                    const openCount = onlineState.relay ? onlineState.relay.openIds().length : 0;
+                    if (!openCount) {
+                        setOnlineStatusUI('Reaching match network...', 'bg-amber-400 animate-pulse', onlineState.roomId);
+                    } else if (ticks > 6) {
+                        setOnlineStatusUI('Waiting for host ' + onlineState.roomId + '. Check the code is still open.', 'bg-amber-400 animate-pulse', onlineState.roomId);
+                    }
+                }
+                const pending = onlineState.unacked;
+                if (pending && ticks % 2 === 0) {
+                    pending.tries = (pending.tries || 0) + 1;
+                    if (pending.tries > 5) onlineState.unacked = null;
+                    else sendOnlineMessage(pending);
+                }
+            }, 1500);
+        }
+
+        function createOnlineRoom() {
             destroyOnlinePeer();
 
             const roomId = generateRoomCode();
@@ -2246,6 +2848,7 @@
             onlineState.processedShotId = -1;
             onlineState.resolvedShotId = -1;
             onlineState.turnAdvancedShotId = -1;
+            resetOnlineCounters();
 
             onlineState.room = {
                 roomId,
@@ -2264,95 +2867,24 @@
                 lockedShot: null,
                 keeperDive: null,
                 lastOutcome: null,
-                rematchCount: 0
+                rematchCount: 0,
+                rev: 0
             };
 
             updateInviteShareUI(roomId);
-            setOnlineStatusUI('Connecting to match server...', 'bg-amber-400 animate-pulse', roomId);
+            setOnlineStatusUI('Connecting to match network...', 'bg-amber-400 animate-pulse', roomId);
             updateHUD();
-
-            let PeerCtor;
-            try {
-                PeerCtor = await ensurePeerJSLib();
-            } catch (err) {
-                setOnlineStatusUI('Network blocked. Check internet connection.', 'bg-rose-500', roomId);
-                return;
-            }
-
-            const peer = new PeerCtor(PEER_PREFIX + roomId, PEER_CONFIG);
-            onlineState.peer = peer;
-
-            peer.on('open', () => {
-                setOnlineStatusUI('Room live! Waiting for friend to enter code...', 'bg-emerald-400 animate-pulse', roomId);
-            });
-
-            peer.on('connection', (conn) => {
-                if (onlineState.conn && onlineState.conn.open) {
-                    conn.close();
-                    return;
-                }
-                onlineState.conn = conn;
-                attachHostConnectionHandlers(conn);
-            });
-
-            peer.on('error', (err) => {
-                if (err && err.type === 'unavailable-id' && retryCount < 4) {
-                    createOnlineRoom(retryCount + 1);
-                    return;
-                }
-                setOnlineStatusUI('Connection interrupted. Tap New Room Code.', 'bg-rose-500', roomId);
-            });
+            onlineState.relay = createMatchRelay(handleOnlinePacket);
+            startHostHeartbeat();
+            onlineState.readyWatchTimer = setTimeout(() => {
+                if (!onlineState.relay || onlineState.role !== 1) return;
+                if (onlineState.relay.openIds().length) return;
+                if (!onlineState.room || onlineState.room.status !== 'WAITING') return;
+                setOnlineStatusUI('Cannot reach a match network. Check internet, then tap New Room Code.', 'bg-rose-500', roomId);
+            }, 8000);
         }
 
-        function attachHostConnectionHandlers(conn) {
-            conn.on('data', (msg) => {
-                if (!msg || typeof msg !== 'object' || !onlineState.room) return;
-
-                if (msg.type === 'HELLO') {
-                    onlineState.room.guestStrikerId = msg.strikerId || 'messi';
-                    onlineState.room.guestKeeperId = msg.keeperId || 'luca';
-                    if (onlineState.room.status === 'WAITING') {
-                        onlineState.room.status = 'ST_AIM';
-                    }
-                    broadcastHostRoomState();
-                } else if (msg.type === 'LOADOUT') {
-                    if (msg.strikerId) onlineState.room.guestStrikerId = msg.strikerId;
-                    if (msg.keeperId) onlineState.room.guestKeeperId = msg.keeperId;
-                    broadcastHostRoomState();
-                } else if (msg.type === 'SHOT_SUBMIT' && msg.shot) {
-                    if (onlineState.room.status === 'ST_AIM' && onlineState.room.currentShooter === 2) {
-                        onlineState.room.status = 'GK_DEFEND';
-                        onlineState.room.shotId = (onlineState.room.shotId || 0) + 1;
-                        onlineState.room.lockedShot = msg.shot;
-                        onlineState.room.keeperDive = null;
-                        onlineState.room.lastOutcome = null;
-                        broadcastHostRoomState();
-                    }
-                } else if (msg.type === 'KEEPER_DIVE') {
-                    if (onlineState.room.status === 'GK_DEFEND' && onlineState.room.currentShooter === 1) {
-                        onlineState.room.keeperDive = {
-                            targetX: msg.targetX,
-                            targetY: msg.targetY,
-                            committed: true
-                        };
-                        broadcastHostRoomState();
-                    }
-                } else if (msg.type === 'REMATCH') {
-                    resetOnlineHostRoom();
-                }
-            });
-
-            conn.on('close', () => {
-                if (onlineState.room) {
-                    onlineState.room.status = 'WAITING';
-                    applyRoomSnapshot(onlineState.room);
-                    setOnlineStatusUI('Friend disconnected. Waiting for rejoin...', 'bg-amber-400 animate-pulse', onlineState.roomId);
-                    openOnlineLobby();
-                }
-            });
-        }
-
-        async function joinOnlineRoom(rawCode) {
+        function joinOnlineRoom(rawCode) {
             const roomId = extractRoomCode(rawCode);
             if (!roomId || roomId.length < 4) {
                 setOnlineStatusUI('Please enter a valid 6-character Room Code.', 'bg-rose-500');
@@ -2362,86 +2894,50 @@
             state.gameMode = 'ONLINE';
             bgCacheValid = false;
             openOnlineLobby();
-            setOnlineStatusUI(`Connecting to room ${roomId}...`, 'bg-amber-400 animate-pulse', roomId);
+            setOnlineStatusUI('Connecting to room ' + roomId + '...', 'bg-amber-400 animate-pulse', roomId);
 
             destroyOnlinePeer();
             onlineState.roomId = roomId;
             onlineState.role = 2;
+            onlineState.room = null;
             onlineState.processedShotId = -1;
             onlineState.resolvedShotId = -1;
             onlineState.turnAdvancedShotId = -1;
+            resetOnlineCounters();
             updateInviteShareUI(roomId);
+            updateHUD();
 
-            let PeerCtor;
-            try {
-                PeerCtor = await ensurePeerJSLib();
-            } catch (err) {
-                setOnlineStatusUI('Network blocked. Check internet connection.', 'bg-rose-500', roomId);
-                return;
-            }
-
-            const peer = new PeerCtor(undefined, PEER_CONFIG);
-            onlineState.peer = peer;
-
-            let connected = false;
-            const connectTimeout = setTimeout(() => {
-                if (!connected) {
-                    setOnlineStatusUI(`Room "${roomId}" not found or host offline.`, 'bg-rose-500', roomId);
-                }
-            }, 10000);
-
-            peer.on('open', () => {
-                const conn = peer.connect(PEER_PREFIX + roomId, { reliable: true });
-                onlineState.conn = conn;
-
-                conn.on('open', () => {
-                    connected = true;
-                    clearTimeout(connectTimeout);
-                    sendOnlineMessage({
-                        type: 'HELLO',
-                        strikerId: state.equipped,
-                        keeperId: state.equippedGK
-                    });
-                });
-
-                conn.on('data', (msg) => {
-                    if (!msg || typeof msg !== 'object') return;
-                    if (msg.type === 'STATE_SYNC' && msg.room) {
-                        applyRoomSnapshot(msg.room);
-                    }
-                });
-
-                conn.on('close', () => {
-                    setOnlineStatusUI('Host ended the match.', 'bg-rose-500', roomId);
-                    openOnlineLobby();
-                });
-
-                conn.on('error', () => {
-                    clearTimeout(connectTimeout);
-                    setOnlineStatusUI(`Could not connect to room "${roomId}".`, 'bg-rose-500', roomId);
-                });
-            });
-
-            peer.on('error', () => {
-                clearTimeout(connectTimeout);
-                setOnlineStatusUI(`Room "${roomId}" unavailable. Check code.`, 'bg-rose-500', roomId);
-            });
+            onlineState.relay = createMatchRelay(handleOnlinePacket);
+            startGuestHello();
+            startGuestResend();
         }
 
         function applyRoomSnapshot(r) {
-            const prevStatus = onlineState.room ? onlineState.room.status : null;
+            // Track the previous status separately. The host mutates the same room
+            // object before broadcasting, so reading room.status here always looked
+            // like the match had already started and the lobby never closed.
+            const prevStatus = onlineState.prevRoomStatus;
             onlineState.room = r;
 
             if (r.status === 'WAITING') {
                 onlineState.localPhase = 'WAITING';
-                setOnlineStatusUI('Room live! Waiting for friend to enter code...', 'bg-emerald-400 animate-pulse', r.roomId);
+                if (onlineState.role === 1 && onlineState.relay && onlineState.relay.openIds().length) {
+                    setOnlineStatusUI('Room live! Waiting for friend to enter code...', 'bg-emerald-400 animate-pulse', r.roomId);
+                } else if (onlineState.role === 2) {
+                    setOnlineStatusUI('Joined ' + (r.roomId || onlineState.roomId) + '. Waiting for the host...', 'bg-amber-400 animate-pulse', r.roomId || onlineState.roomId);
+                }
             } else {
-                if (prevStatus === 'WAITING' || prevStatus === null) {
+                if (prevStatus === 'WAITING' || prevStatus == null) {
                     closeOnlineLobby();
                     playUnlockFanfare();
                     showUnlockBanner('LIVE', 'OPPONENT CONNECTED!', 'ONLINE 1V1 PENALTY SHOOTOUT STARTED!');
                 }
                 setOnlineStatusUI('Connected • Live 1v1 Match', 'bg-emerald-400', r.roomId);
+            }
+            onlineState.prevRoomStatus = r.status;
+            if (onlineState.role === 2 && r.status !== 'WAITING' && onlineState.helloTimer) {
+                clearInterval(onlineState.helloTimer);
+                onlineState.helloTimer = null;
             }
 
             if (r.rematchCount && r.rematchCount !== onlineState.rematchSynced) {
@@ -2478,6 +2974,14 @@
                 keeper.diveTargetX = r.keeperDive.targetX;
                 keeper.diveTargetY = r.keeperDive.targetY;
                 keeper.diveProgress = 0;
+            }
+
+            const pending = onlineState.unacked;
+            if (pending && onlineState.role === 2) {
+                if (pending.type === 'SHOT_SUBMIT' && r.status !== 'ST_AIM') onlineState.unacked = null;
+                else if (pending.type === 'KEEPER_DIVE' && r.keeperDive && r.keeperDive.committed) onlineState.unacked = null;
+                else if (pending.type === 'LOADOUT') onlineState.unacked = null;
+                else if (pending.type === 'REMATCH' && r.status === 'ST_AIM' && (r.rematchCount || 0) > (onlineState.rematchSynced || 0)) onlineState.unacked = null;
             }
 
             updateHUD();
@@ -2578,7 +3082,7 @@
                 onlineState.room.lastOutcome = null;
                 broadcastHostRoomState();
             } else {
-                sendOnlineMessage({
+                queueGuestAction({
                     type: 'SHOT_SUBMIT',
                     shot: serializedShot
                 });
@@ -2595,7 +3099,7 @@
                 };
                 broadcastHostRoomState();
             } else {
-                sendOnlineMessage({
+                queueGuestAction({
                     type: 'KEEPER_DIVE',
                     targetX,
                     targetY
@@ -2610,7 +3114,7 @@
                 onlineState.room.hostKeeperId = state.equippedGK;
                 broadcastHostRoomState();
             } else {
-                sendOnlineMessage({
+                queueGuestAction({
                     type: 'LOADOUT',
                     strikerId: state.equipped,
                     keeperId: state.equippedGK
@@ -2899,7 +3403,7 @@
             if (onlineState.role === 1) {
                 resetOnlineHostRoom();
             } else {
-                sendOnlineMessage({ type: 'REMATCH' });
+                queueGuestAction({ type: 'REMATCH' });
             }
         }
 
@@ -4405,12 +4909,44 @@
 
         document.getElementById('copyInviteUrlBtn').addEventListener('click', () => {
             const urlInput = document.getElementById('onlineInviteUrlInput');
-            urlInput.select();
-            urlInput.setSelectionRange(0, 99999);
-            try {
-                document.execCommand('copy');
+            const text = urlInput.value || '';
+            const showCopied = () => {
                 document.getElementById('copyUrlFeedback').classList.remove('hidden');
-            } catch (_) {}
+            };
+            const fallbackCopy = () => {
+                urlInput.focus();
+                urlInput.select();
+                urlInput.setSelectionRange(0, text.length);
+                try {
+                    document.execCommand('copy');
+                    showCopied();
+                } catch (_) {}
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(showCopied).catch(fallbackCopy);
+            } else {
+                fallbackCopy();
+            }
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') return;
+            if (!onlineState.relay || !onlineState.roomId) return;
+            onlineState.relay.nudge();
+            if (onlineState.role === 1 && onlineState.room) {
+                broadcastHostRoomState();
+            } else if (onlineState.role === 2) {
+                if (!onlineState.room || !onlineState.room.status || onlineState.room.status === 'WAITING') {
+                    sendOnlineMessage({
+                        type: 'HELLO',
+                        id: onlineState.clientId + '-hello',
+                        strikerId: state.equipped,
+                        keeperId: state.equippedGK
+                    });
+                } else if (onlineState.unacked) {
+                    sendOnlineMessage(onlineState.unacked);
+                }
+            }
         });
 
         document.getElementById('joinOnlineRoomForm').addEventListener('submit', (e) => {
