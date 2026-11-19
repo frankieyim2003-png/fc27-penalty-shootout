@@ -1419,10 +1419,14 @@
         }
 
         function updateKeeperAimFromJoystick(nx, ny) {
+            // nx/ny are screen-space: left and up are negative, matching the knob and arrow keys.
             gkSim.joyX = Math.max(-1, Math.min(1, nx));
             gkSim.joyY = Math.max(-1, Math.min(1, ny));
             gkSim.hasAimed = true;
-            gkSim.aimX = gkSim.joyX * (GOAL_HALF_W - 0.25);
+            // project3DGK mirrors world X (screen-left is +X) because the camera sits
+            // behind the goal. Flip the stick here so a left input dives left on screen.
+            // Vertical is already screen-correct: dragging down lowers the aim.
+            gkSim.aimX = -gkSim.joyX * (GOAL_HALF_W - 0.25);
             gkSim.aimY = Math.max(0.28, Math.min(GOAL_HEIGHT - 0.20, 1.15 - gkSim.joyY * 1.05));
 
             const mag = Math.hypot(gkSim.joyX, gkSim.joyY);
@@ -1624,7 +1628,8 @@
 
         // --- 12. GOALKEEPER MODE SIMULATION ---
         function describeGoalZone(x, y) {
-            const hStr = x < -0.95 ? 'LEFT' : x > 0.95 ? 'RIGHT' : 'CENTER';
+            // Keeper camera mirrors world X, so +X is the left side of the screen.
+            const hStr = x > 0.95 ? 'LEFT' : x < -0.95 ? 'RIGHT' : 'CENTER';
             const vStr = y > 1.55 ? 'TOP' : y < 0.85 ? 'BOTTOM' : 'MID';
             return `${vStr} ${hStr}`;
         }
